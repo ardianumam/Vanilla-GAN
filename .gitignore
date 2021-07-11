@@ -1,3 +1,7 @@
+# logging
+runs*/*
+tf_log/*
+weight*/*
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -130,14 +134,7 @@ dmypy.json
 .DS_Store
 
 # Dataset
-data/MNIST
-data/Camelyon16
-data/DF2K
-data/DIV2K
-data/DF2K+OST
-data/Digital-pathology
-data/ImageNet2012
-data/Paper
+data/*
 
 # Program run create directory.
 benchmarks
