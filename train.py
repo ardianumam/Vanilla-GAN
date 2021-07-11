@@ -1,22 +1,10 @@
-# Copyright 2021 Dakewe Biotech Corporation. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 (the "License");
-#   you may not use this file except in compliance with the License.
-#   You may obtain a copy of the License at
-#
-#       http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
 import argparse
 import logging
 import os
 import random
 import time
 import warnings
+import numpy as np
 
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
@@ -35,6 +23,9 @@ from gan_pytorch.utils.common import AverageMeter
 from gan_pytorch.utils.common import ProgressMeter
 from gan_pytorch.utils.common import configure
 from gan_pytorch.utils.common import create_folder
+
+RUNS_DIR = "runs_512"
+WEIGHTS_DIR = "weights_512"
 
 # Find all available models.
 model_names = sorted(name for name in models.__dict__ if name.islower() and not name.startswith("__") and callable(models.__dict__[name]))
@@ -138,6 +129,12 @@ def main_worker(ngpus_per_node, args):
     # Loss of original GAN paper.
     adversarial_criterion = nn.BCELoss().cuda(args.gpu)
 
+    # load stored model
+    if args.test:
+        epoch = args.test_epoch
+        generator.load_state_dict(torch.load(os.path.join(WEIGHTS_DIR, f"Generator_epoch{epoch}.pth"),map_location='cuda:0'))
+        discriminator.load_state_dict(torch.load(os.path.join(WEIGHTS_DIR, f"Discriminator_epoch{epoch}.pth"),map_location='cuda:0'))
+
     fixed_noise = torch.randn([args.batch_size, 100])
     if args.gpu is not None:
         fixed_noise = fixed_noise.cuda(args.gpu)
@@ -173,7 +170,7 @@ def main_worker(ngpus_per_node, args):
         generator.load_state_dict(torch.load(args.netG))
 
     # Create a SummaryWriter at the beginning of training.
-    writer = SummaryWriter(f"runs/{args.arch}_logs")
+    writer = SummaryWriter(f"{RUNS_DIR}/{args.arch}_logs")
 
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
@@ -185,9 +182,12 @@ def main_worker(ngpus_per_node, args):
         d_x_losses = AverageMeter("D(x)", ":6.6f")
         d_g_z1_losses = AverageMeter("D(G(z1))", ":6.6f")
         d_g_z2_losses = AverageMeter("D(G(z2))", ":6.6f")
+        acc_D_valids = AverageMeter("Acc_D_V", ":6.6f")
+        acc_D_fakes = AverageMeter("Acc_D_F", ":6.6f")
+        acc_Gs = AverageMeter("Acc_G", ":6.6f")
 
         progress = ProgressMeter(num_batches=len(dataloader),
-                                 meters=[batch_time, d_losses, g_losses, d_x_losses, d_g_z1_losses, d_g_z2_losses],
+                                 meters=[batch_time, d_losses, g_losses, d_x_losses, d_g_z1_losses, d_g_z2_losses, acc_D_valids, acc_D_fakes, acc_Gs],
                                  prefix=f"Epoch: [{epoch}]")
 
         # Switch to train mode.
@@ -221,6 +221,10 @@ def main_worker(ngpus_per_node, args):
             d_loss_real = adversarial_criterion(real_output, real_label)
             d_loss_real.backward()
             d_x = real_output.mean()
+            # Calculate ACC
+            pred = torch.round(real_output)
+            acc_D_valid = np.asscalar((pred == real_label).float().mean().detach().cpu().numpy())
+            # print("acc_D_valid:", acc_D_valid)
 
             # Train with fake.
             fake = generator(noise)
@@ -228,6 +232,12 @@ def main_worker(ngpus_per_node, args):
             d_loss_fake = adversarial_criterion(fake_output, fake_label)
             d_loss_fake.backward()
             d_g_z1 = fake_output.mean()
+            # Calculate ACC
+            pred = torch.round(fake_output)
+            acc_D_fake = np.asscalar((pred == fake_label).float().mean().detach().cpu().numpy())
+            # print("acc_D_fake:", acc_D_fake)
+            acc_D = (acc_D_valid+acc_D_fake)/2
+            # raise Exception("STOP!!!!")
 
             # Count all discriminator losses.
             d_loss = d_loss_real + d_loss_fake
@@ -244,6 +254,10 @@ def main_worker(ngpus_per_node, args):
             g_loss.backward()
             d_g_z2 = fake_output.mean()
             generator_optimizer.step()
+            # Calculate ACC
+            pred = torch.round(fake_output)
+            acc_G = np.asscalar((pred == real_label).float().mean().detach().cpu().numpy())
+            # print("acc_G:", acc_G)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -255,6 +269,9 @@ def main_worker(ngpus_per_node, args):
             d_x_losses.update(d_x.item(), real.size(0))
             d_g_z1_losses.update(d_g_z1.item(), real.size(0))
             d_g_z2_losses.update(d_g_z2.item(), real.size(0))
+            acc_D_valids.update(acc_D_valid)
+            acc_D_fakes.update(acc_D_fake)
+            acc_Gs.update(acc_G)
 
             iters = i + epoch * len(dataloader) + 1
             writer.add_scalar("Train/D_Loss", d_loss.item(), iters)
@@ -262,6 +279,9 @@ def main_worker(ngpus_per_node, args):
             writer.add_scalar("Train/D_x", d_x.item(), iters)
             writer.add_scalar("Train/D_G_z1", d_g_z1.item(), iters)
             writer.add_scalar("Train/D_G_z2", d_g_z2.item(), iters)
+            writer.add_scalar("Train/Acc_D_V", acc_D_valid, iters)
+            writer.add_scalar("Train/Acc_D_F", acc_D_fake, iters)
+            writer.add_scalar("Train/Acc_G", acc_G, iters)
 
             # Output results every 100 batches.
             if i % 100 == 0:
@@ -272,13 +292,13 @@ def main_worker(ngpus_per_node, args):
             # Switch model to eval mode.
             generator.eval()
             sr = generator(fixed_noise)
-            vutils.save_image(sr.detach(), os.path.join("runs", f"GAN_epoch_{epoch}.png"), normalize=True)
+            vutils.save_image(sr.detach(), os.path.join(RUNS_DIR, f"GAN_epoch_{epoch}.png"), normalize=True)
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-            torch.save(generator.state_dict(), os.path.join("weights", f"Generator_epoch{epoch}.pth"))
-            torch.save(discriminator.state_dict(), os.path.join("weights", f"Discriminator_epoch{epoch}.pth"))
+            torch.save(generator.state_dict(), os.path.join(WEIGHTS_DIR, f"Generator_epoch{epoch}.pth"))
+            torch.save(discriminator.state_dict(), os.path.join(WEIGHTS_DIR, f"Discriminator_epoch{epoch}.pth"))
 
-    torch.save(generator.state_dict(), os.path.join("weights", f"GAN-last.pth"))
+    torch.save(generator.state_dict(), os.path.join(WEIGHTS_DIR, f"GAN-last.pth"))
 
 
 if __name__ == "__main__":
@@ -287,7 +307,7 @@ if __name__ == "__main__":
                         help="Model architecture: " +
                              " | ".join(model_names) +
                              ". (Default: `gan`)")
-    parser.add_argument("data", metavar="DIR",
+    parser.add_argument("--data", default="data", type=str,
                         help="Path to dataset.")
     parser.add_argument("--workers", default=4, type=int,
                         help="Number of data loading workers. (Default: 4)")
@@ -319,20 +339,24 @@ if __name__ == "__main__":
                         help="Distributed backend. (Default: `nccl`)")
     parser.add_argument("--seed", default=None, type=int,
                         help="Seed for initializing training.")
-    parser.add_argument("--gpu", default=None, type=int,
+    parser.add_argument("--gpu", default=0, type=int,
                         help="GPU id to use.")
     parser.add_argument("--multiprocessing-distributed", action="store_true",
                         help="Use multi-processing distributed training to launch "
                              "N processes per node, which has N GPUs. This is the "
                              "fastest way to use PyTorch for either single node or "
                              "multi node data parallel training.")
+    parser.add_argument("--test", default=False, type=bool,
+                        help="Testing purpose.")
+    parser.add_argument("--test_epoch", default=127, type=int,
+                        help="Epoch trained model that will be tested.")
     args = parser.parse_args()
 
     print("##################################################\n")
     print("Run Training Engine.\n")
 
-    create_folder("runs")
-    create_folder("weights")
+    create_folder(RUNS_DIR)
+    create_folder(WEIGHTS_DIR)
 
     logger.info("TrainingEngine:")
     print("\tAPI version .......... 0.2.0")
